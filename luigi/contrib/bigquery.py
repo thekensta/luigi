@@ -17,8 +17,12 @@
 
 import collections
 import logging
+import os
+
 import luigi.target
 import time
+
+import luigi.contrib.gcs as gcs
 
 logger = logging.getLogger('luigi-interface')
 
@@ -49,10 +53,19 @@ class QueryMode(object):
     BATCH = 'BATCH'
 
 
-class SourceFormat(object):
+class DestinationFormat(object):
     CSV = 'CSV'
-    DATASTORE_BACKUP = 'DATASTORE_BACKUP'
     NEWLINE_DELIMITED_JSON = 'NEWLINE_DELIMITED_JSON'
+    AVRO = 'AVRO'
+
+
+class SourceFormat(DestinationFormat):
+    DATASTORE_BACKUP = 'DATASTORE_BACKUP'
+
+
+class Compression(object):
+    NONE = 'NONE'
+    GZIP = 'GZIP'
 
 
 class FieldDelimiter(object):
@@ -538,7 +551,6 @@ class BigqueryLoadTask(MixinBigqueryBulkComplete, luigi.Task):
 
 
 class BigqueryRunQueryTask(MixinBigqueryBulkComplete, luigi.Task):
-
     @property
     def write_disposition(self):
         """What to do if the table already exists. By default this will fail the job.
@@ -639,6 +651,140 @@ class BigqueryCreateViewTask(luigi.Task):
         logger.info('View SQL: %s', view)
 
         output.client.update_view(output.table, view)
+
+
+class BigqueryExtractTarget(luigi.target.Target):
+    """Wrapper mapping from destinationUris property to GCSTarget.
+
+    When a wildcard (*) is used in the path, Big Query will write multiple files
+    to a directory. In this case write the _SUCCESS file to the directory
+
+    Limitations:
+
+    Currently don't support multiple output paths for Hadoop on GCP or
+    wildcards in the directory path (neither does gsutil).
+    https://cloud.google.com/bigquery/docs/exporting-data#exporting_data_into_one_or_more_files
+
+    changing the output from gs://[your-bucket]/data*.json to
+    gs://[your-bucket]/data*.csv will not register as a new target
+
+    """
+
+    def __init__(self, path, flag='_SUCCESS', client=None, gcs_client=None):
+
+        self.client = client or BigqueryClient()
+        self.path = path
+        self.wildcard = False
+
+        if '*' in path:
+            self.wildcard = True
+            directory = os.path.dirname(path)
+            assert '*' not in directory, \
+                'Wildcard (*) only supported in filename %s' % (path,)
+
+            self._target = gcs.GCSTarget(os.path.join(directory, flag),
+                                         client=gcs_client)
+        else:
+            self._target = gcs.GCSTarget(path, client=gcs_client)
+
+    def exists(self):
+        return self._target.exists()
+
+    def finalise(self):
+        """Write the flag file (_SUCCESS) if there is a wildcard in the path."""
+        if self.wildcard:
+            self._target._touchz()
+
+    @property
+    def destination_uris(self):
+        return [self.path]
+
+
+class BigqueryExtractTask(luigi.task.MixinNaiveBulkComplete, luigi.Task):
+    """
+    Extracts (exports) a Big Query table to Google Cloud Storage.
+
+    The output of this task needs to be BigQueryExtract Target
+    Instance of this class should implement property source_table
+    specifying the project, dataset and table to extract.
+
+    https://cloud.google.com/bigquery/docs/exporting-data
+    """
+
+    def output(self):
+        # return BigqueryExtractTarget('gs://[YOUR-BUCKET]/data.json')
+        raise NotImplementedError()
+
+    @property
+    def source_table(self):
+        # return BQTable(project_id, dataset_id, table_id)
+        raise NotImplementedError()
+
+    @property
+    def compression(self):
+        return Compression.NONE
+
+    @property
+    def destination_format(self):
+        return DestinationFormat.CSV
+
+    @property
+    def field_delimiter(self):
+        return FieldDelimiter.COMMA
+
+    @property
+    def print_header(self):
+        return True
+
+    def run(self):
+
+        output = self.output()
+
+        # Follow pattern of validation checks above
+        assert isinstance(output, BigqueryExtractTarget), \
+            'Output should be BigqueryExtractTarget not {}'.format(output)
+
+        assert all(x.startswith('gs://') for x in output.destination_uris)
+
+        source_table = self.source_table
+        job = {
+            'projectId': source_table.project_id,
+            'configuration': {
+                'extract': {
+                    'destinationFormat': self.destination_format,
+                    'destinationUris': output.destination_uris,
+                    'sourceTable': {
+                        'datasetId': source_table.dataset_id,
+                        'projectId': source_table.project_id,
+                        'tableId': source_table.table_id
+                    }
+                }
+            }
+        }
+
+        # Set conditional formatting options
+        if self.destination_format in (DestinationFormat.NEWLINE_DELIMITED_JSON,
+                                       DestinationFormat.CSV):
+            job['configuration']['extract']['compression'] = self.compression
+
+        if self.destination_format == DestinationFormat.CSV:
+            job['configuration']['extract'][
+                'fieldDelimiter'] = self.field_delimiter
+            job['configuration']['extract']['printHeader'] = self.print_header
+
+
+        logger.info("Extracting Big Query Table {pid}:{did}.{tid} to {gs}".format(
+            pid=self.source_table.project_id,
+            did=self.source_table.dataset_id,
+            tid=self.source_table.table_id,
+            gs="".join(output.destination_uris)
+        ))
+
+        bq_client = output.client
+        bq_client.run_job(source_table.project_id, job)
+
+        # write the flag (default=_SUCCESS) file if required
+        output.finalise()
 
 
 class ExternalBigqueryTask(MixinBigqueryBulkComplete, luigi.ExternalTask):

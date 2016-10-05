@@ -79,6 +79,24 @@ class TestCreateViewTask(bigquery.BigqueryCreateViewTask):
         return bigquery.BigqueryTarget(PROJECT_ID, DATASET_ID, 'view1', client=self.client)
 
 
+class TestExtractTask(bigquery.BigqueryExtractTask):
+
+    client = MagicMock()
+    gcs_client = MagicMock()
+
+    table = luigi.Parameter()
+    path = luigi.Parameter()
+
+    @property
+    def source_table(self):
+        return bigquery.BQTable(PROJECT_ID, DATASET_ID, self.table)
+
+    def output(self):
+        return bigquery.BigqueryExtractTarget(self.path,
+                                              client=self.client,
+                                              gcs_client=self.gcs_client)
+
+
 class BigqueryTest(unittest.TestCase):
 
     def test_bulk_complete(self):
@@ -161,3 +179,47 @@ class BigqueryTest(unittest.TestCase):
     def test_dont_flatten_results(self):
         task = TestRunQueryTaskDontFlattenResults(table='table3')
         self.assertFalse(task.flatten_results)
+
+    def test_extract_task(self):
+        task = TestExtractTask(table='table4', path='gs://bucket/file.csv')
+        task.run()
+
+        (pid, job), _ = task.client.run_job.call_args
+
+        self.assertEqual(job['configuration']['extract']['destinationUris'],
+                         ['gs://bucket/file.csv'])
+        self.assertEqual(job['configuration']['extract']['sourceTable']['projectId'],
+                         PROJECT_ID)
+        self.assertEqual(job['configuration']['extract']['sourceTable']['datasetId'],
+                         DATASET_ID)
+        self.assertEqual(job['configuration']['extract']['sourceTable']['tableId'],
+                         'table4')
+
+    def test_extract_target_file(self):
+        bq_client = MagicMock()
+        gcs_client = MagicMock()
+        target = bigquery.BigqueryExtractTarget('gs://bucket/file.csv',
+                                                client=bq_client,
+                                                gcs_client=gcs_client)
+        self.assertEqual(target._target.path, 'gs://bucket/file.csv')
+
+    def test_extract_target_wildcard(self):
+        bq_client = MagicMock()
+        gcs_client = MagicMock()
+        target = bigquery.BigqueryExtractTarget('gs://bucket/file*.csv',
+                                                client=bq_client,
+                                                gcs_client=gcs_client)
+        self.assertEqual(target._target.path, 'gs://bucket/_SUCCESS')
+
+    def test_extract_target_invalid_path(self):
+        bq_client = MagicMock()
+        gcs_client = MagicMock()
+        with self.assertRaises(AssertionError):
+            bigquery.BigqueryExtractTarget('gs://bucket*/file.csv',
+                                           client=bq_client,
+                                           gcs_client=gcs_client)
+
+    def test_extract_target_invalid_path_scheme(self):
+        task = TestExtractTask(table='table4', path='s3://bucket/file.csv')
+        with self.assertRaises(AssertionError):
+            task.run()
